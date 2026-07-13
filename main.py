@@ -2,7 +2,9 @@ from fastapi import FastAPI, HTTPException, Header, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+JSONDict = Dict[str, Any]
 import os
 import base64
 import time
@@ -34,7 +36,7 @@ app.add_middleware(
 ALLOWED_CREATOR_ROLES = {"boss", "manager", "academic_director", "head_teacher"}
 
 
-def get_caller_profile(authorization: str | None) -> dict:
+def get_caller_profile(authorization: str | None) -> JSONDict:
     """Проверяет JWT из заголовка Authorization и возвращает profile вызывающего.
     Бросает HTTPException(401/403), если токен отсутствует/невалиден или роль не разрешена."""
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -51,7 +53,7 @@ def get_caller_profile(authorization: str | None) -> dict:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Недействительный токен авторизации")
 
     profile = supabase.table("profiles").select("role, assigned_subject_id").eq("id", user.id).single().execute()
-    caller_profile = profile.data or {}
+    caller_profile: JSONDict = profile.data or {}
 
     if caller_profile.get("role") not in ALLOWED_CREATOR_ROLES:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав для добавления сотрудников")
@@ -141,7 +143,7 @@ def create_employee(employee: EmployeeCreate, authorization: str | None = Header
 PAYME_KEY = os.getenv("PAYME_KEY") or ""
 
 
-def _payme_error(request_id, code: int, message_ru: str):
+def _payme_error(request_id: Any, code: int, message_ru: str) -> JSONDict:
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -149,23 +151,23 @@ def _payme_error(request_id, code: int, message_ru: str):
     }
 
 
-def _payme_result(request_id, result: dict):
+def _payme_result(request_id: Any, result: JSONDict) -> JSONDict:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
 
 
-def _payme_find_one(table: str, column: str, value):
+def _payme_find_one(table: str, column: str, value: Any) -> Optional[JSONDict]:
     rows = supabase.table(table).select("*").eq(column, value).limit(1).execute().data
     return rows[0] if rows else None
 
 
-def _payme_get_invoice(account: dict):
+def _payme_get_invoice(account: JSONDict) -> Optional[JSONDict]:
     invoice_id = account.get("invoice_id") if account else None
     if not invoice_id:
         return None
     return _payme_find_one("invoices", "id", invoice_id)
 
 
-def _payme_check_perform_transaction(request_id, params):
+def _payme_check_perform_transaction(request_id: Any, params: JSONDict) -> JSONDict:
     invoice = _payme_get_invoice(params.get("account", {}))
     if not invoice:
         return _payme_error(request_id, -31050, "Счёт не найден")
@@ -177,7 +179,7 @@ def _payme_check_perform_transaction(request_id, params):
     return _payme_result(request_id, {"allow": True})
 
 
-def _payme_create_transaction(request_id, params):
+def _payme_create_transaction(request_id: Any, params: JSONDict) -> JSONDict:
     payme_id = params.get("id")
     time_ms = params.get("time")
     amount = params.get("amount")
@@ -211,7 +213,7 @@ def _payme_create_transaction(request_id, params):
     return _payme_result(request_id, {"create_time": time_ms, "transaction": payme_id, "state": 1})
 
 
-def _payme_perform_transaction(request_id, params):
+def _payme_perform_transaction(request_id: Any, params: JSONDict) -> JSONDict:
     payme_id = params.get("id")
     tx = _payme_find_one("payme_transactions", "id", payme_id)
     if not tx:
@@ -223,6 +225,9 @@ def _payme_perform_transaction(request_id, params):
         return _payme_error(request_id, -31008, "Невозможно выполнить операцию")
 
     invoice = _payme_find_one("invoices", "id", tx["invoice_id"])
+    if not invoice:
+        return _payme_error(request_id, -31050, "Счёт не найден")
+
     perform_time = int(time.time() * 1000)
     amount_sum = tx["amount_tiyin"] / 100
 
@@ -248,7 +253,7 @@ def _payme_perform_transaction(request_id, params):
     return _payme_result(request_id, {"transaction": payme_id, "perform_time": perform_time, "state": 2})
 
 
-def _payme_cancel_transaction(request_id, params):
+def _payme_cancel_transaction(request_id: Any, params: JSONDict) -> JSONDict:
     payme_id = params.get("id")
     reason = params.get("reason")
     tx = _payme_find_one("payme_transactions", "id", payme_id)
@@ -275,7 +280,7 @@ def _payme_cancel_transaction(request_id, params):
     return _payme_result(request_id, {"transaction": payme_id, "cancel_time": cancel_time, "state": new_state})
 
 
-def _payme_check_transaction(request_id, params):
+def _payme_check_transaction(request_id: Any, params: JSONDict) -> JSONDict:
     tx = _payme_find_one("payme_transactions", "id", params.get("id"))
     if not tx:
         return _payme_error(request_id, -31003, "Транзакция не найдена")
@@ -285,10 +290,10 @@ def _payme_check_transaction(request_id, params):
     })
 
 
-def _payme_get_statement(request_id, params):
+def _payme_get_statement(request_id: Any, params: JSONDict) -> JSONDict:
     rows = supabase.table("payme_transactions").select("*") \
         .gte("create_time", params.get("from")).lte("create_time", params.get("to")).execute().data or []
-    transactions = [{
+    transactions: List[JSONDict] = [{
         "id": r["id"], "time": r["create_time"], "amount": r["amount_tiyin"],
         "account": {"invoice_id": r["invoice_id"]},
         "create_time": r["create_time"], "perform_time": r["perform_time"], "cancel_time": r["cancel_time"],
@@ -312,7 +317,7 @@ async def payme_webhook(request: Request):
     body = await request.json()
     request_id = body.get("id")
     method = body.get("method")
-    params = body.get("params") or {}
+    params: JSONDict = body.get("params") or {}
 
     auth_header = request.headers.get("Authorization", "")
     login, _, password = "", "", ""
@@ -355,7 +360,7 @@ CONTACT_REQUEST_KEYBOARD = {
 }
 
 
-def _tg_send(chat_id, text: str, reply_markup: Optional[dict] = None):
+def _tg_send(chat_id: Any, text: str, reply_markup: Optional[JSONDict] = None):
     if not TELEGRAM_BOT_TOKEN:
         return
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
@@ -372,12 +377,12 @@ def _tg_last_digits(phone: str, n: int = 9) -> str:
     return digits[-n:] if len(digits) >= n else digits
 
 
-def _tg_linked_student_ids(chat_id) -> List[str]:
+def _tg_linked_student_ids(chat_id: Any) -> List[str]:
     rows = supabase.table("telegram_links").select("student_id").eq("chat_id", chat_id).execute().data or []
     return [r["student_id"] for r in rows]
 
 
-def _tg_handle_start(chat_id):
+def _tg_handle_start(chat_id: Any):
     _tg_send(
         chat_id,
         "Assalomu alaykum! Uniteen o'quv markazi botiga xush kelibsiz.\n\n"
@@ -386,7 +391,7 @@ def _tg_handle_start(chat_id):
     )
 
 
-def _tg_handle_contact(chat_id, contact: dict):
+def _tg_handle_contact(chat_id: Any, contact: JSONDict):
     phone = contact.get("phone_number", "")
     digits = _tg_last_digits(phone)
     if not digits:
@@ -410,7 +415,7 @@ def _tg_handle_contact(chat_id, contact: dict):
     _tg_send(chat_id, f"Bog'landi: {names}\n\nQuyidagi menyudan foydalaning:", MAIN_MENU_KEYBOARD)
 
 
-def _tg_handle_schedule(chat_id, student_ids: List[str]):
+def _tg_handle_schedule(chat_id: Any, student_ids: List[str]):
     students = supabase.table("students").select("id, name, group_id").in_("id", student_ids).execute().data or []
     lines = []
     for s in students:
@@ -422,7 +427,7 @@ def _tg_handle_schedule(chat_id, student_ids: List[str]):
     _tg_send(chat_id, "\n".join(lines) if lines else "Ma'lumot topilmadi")
 
 
-def _tg_handle_homework(chat_id, student_ids: List[str]):
+def _tg_handle_homework(chat_id: Any, student_ids: List[str]):
     students = supabase.table("students").select("id, name, group_id").in_("id", student_ids).execute().data or []
     lines = []
     for s in students:
@@ -438,7 +443,7 @@ def _tg_handle_homework(chat_id, student_ids: List[str]):
     _tg_send(chat_id, "\n".join(lines) if lines else "Vazifalar topilmadi")
 
 
-def _tg_handle_balance(chat_id, student_ids: List[str]):
+def _tg_handle_balance(chat_id: Any, student_ids: List[str]):
     lines = []
     for sid in student_ids:
         student = supabase.table("students").select("name").eq("id", sid).limit(1).execute().data
@@ -450,7 +455,7 @@ def _tg_handle_balance(chat_id, student_ids: List[str]):
     _tg_send(chat_id, "\n".join(lines) if lines else "Ma'lumot topilmadi")
 
 
-def _tg_handle_makeup(chat_id, student_ids: List[str]):
+def _tg_handle_makeup(chat_id: Any, student_ids: List[str]):
     rows = supabase.table("makeup_lessons").select("*").in_("student_id", student_ids).in_("status", ["owed", "scheduled"]).execute().data or []
     if not rows:
         _tg_send(chat_id, "Otrabotkalar yo'q ✅")
