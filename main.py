@@ -6,6 +6,10 @@ from typing import List, Optional
 import os
 import base64
 import time
+import hmac
+import hashlib
+import json
+from urllib.parse import parse_qsl
 import httpx
 from dotenv import load_dotenv
 
@@ -511,3 +515,84 @@ async def _telegram_webhook_inner(request: Request):
         _tg_send(chat_id, "Quyidagi menyudan tanlang:", MAIN_MENU_KEYBOARD)
 
     return {"ok": True}
+
+
+# =========================================================
+# Telegram Mini App — веб-интерфейс, открывающийся прямо внутри Telegram
+# (не отдельное приложение, HTML-страница на фронтенде + telegram-web-app.js).
+# Авторизация — не через email/пароль, а через initData, которую Telegram
+# подписывает сам и передаёт в открытую страницу; бэкенд проверяет подпись
+# тем же BOT_TOKEN, которым бот был создан (только у нас и у Telegram он есть).
+# =========================================================
+
+def _tg_verify_init_data(init_data: str) -> dict:
+    """Проверяет подпись initData по алгоритму Telegram. Бросает ValueError, если невалидна."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN не задан на сервере")
+
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        raise ValueError("Отсутствует hash")
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        raise ValueError("Подпись initData не совпадает")
+
+    auth_date = int(pairs.get("auth_date", "0"))
+    if auth_date and (time.time() - auth_date) > 86400:
+        raise ValueError("initData устарела")
+
+    user_raw = pairs.get("user")
+    user = json.loads(user_raw) if user_raw else {}
+    return {"user": user}
+
+
+class MiniAppRequest(BaseModel):
+    initData: str
+
+
+@app.post("/telegram/miniapp/data")
+def telegram_miniapp_data(payload: MiniAppRequest):
+    try:
+        verified = _tg_verify_init_data(payload.initData)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+
+    chat_id = verified["user"].get("id")
+    if not chat_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Telegram foydalanuvchisi topilmadi")
+
+    student_ids = _tg_linked_student_ids(chat_id)
+    if not student_ids:
+        return {"linked": False, "students": []}
+
+    students = supabase.table("students").select("id, name, group_id").in_("id", student_ids).execute().data or []
+
+    result = []
+    for s in students:
+        schedule = []
+        homework = []
+        if s.get("group_id"):
+            schedule = supabase.table("schedule_entries").select("day_of_week, start_time").eq("group_id", s["group_id"]).execute().data or []
+            homework = supabase.table("homework_assignments").select("title, description, due_date") \
+                .eq("group_id", s["group_id"]).order("due_date", desc=True).limit(10).execute().data or []
+
+        coverage = supabase.table("student_coverage_view").select("covered").eq("student_id", s["id"]).limit(1).execute().data
+        covered = coverage[0]["covered"] if coverage else None
+
+        makeup = supabase.table("makeup_lessons").select("*").eq("student_id", s["id"]).in_("status", ["owed", "scheduled"]).execute().data or []
+
+        result.append({
+            "id": s["id"],
+            "name": s["name"],
+            "schedule": schedule,
+            "homework": homework,
+            "covered": covered,
+            "makeup": makeup,
+        })
+
+    return {"linked": True, "students": result}
