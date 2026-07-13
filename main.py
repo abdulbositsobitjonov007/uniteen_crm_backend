@@ -466,6 +466,17 @@ def _tg_handle_makeup(chat_id, student_ids: List[str]):
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
+    # Telegram ретраит и в итоге отключает вебхук после серии 5xx — что бы ни
+    # случилось внутри, отвечаем 200, иначе бот выглядит "мёртвым" для всех
+    # пользователей из-за одной сломанной таблицы/запроса.
+    try:
+        return await _telegram_webhook_inner(request)
+    except Exception as e:
+        print(f"[telegram webhook error] {e}")
+        return {"ok": True}
+
+
+async def _telegram_webhook_inner(request: Request):
     update = await request.json()
     message = update.get("message")
     if not message:
