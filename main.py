@@ -15,10 +15,10 @@ supabase: Client = create_client(url, key)
 
 app = FastAPI(title="Uniteen CRM API")
 
-# Настройка CORS: разрешаем твоему React (на порту 5173) делать запросы к Python
+# Настройка CORS: разрешаем твоему React делать запросы к Python
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://uniteen-crm.vercel.app"], 
+    allow_origins=["http://localhost:5173", "http://localhost:5174", "https://uniteen-crm.vercel.app"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
