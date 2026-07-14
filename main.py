@@ -361,14 +361,17 @@ CONTACT_REQUEST_KEYBOARD = {
 
 def _tg_send(chat_id, text: str, reply_markup: Optional[dict] = None):
     if not TELEGRAM_BOT_TOKEN:
+        print("[telegram send skipped] TELEGRAM_BOT_TOKEN is not set on this server")
         return
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
+        resp = httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"[telegram send failed] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[telegram send error] {e}")
 
 
 def _tg_last_digits(phone: str, n: int = 9) -> str:
