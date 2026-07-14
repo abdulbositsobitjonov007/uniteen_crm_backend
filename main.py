@@ -8,6 +8,10 @@ JSONDict = Dict[str, Any]
 import os
 import base64
 import time
+import hmac
+import hashlib
+import json
+from urllib.parse import parse_qsl
 import httpx
 from dotenv import load_dotenv
 
@@ -362,14 +366,17 @@ CONTACT_REQUEST_KEYBOARD = {
 
 def _tg_send(chat_id: Any, text: str, reply_markup: Optional[JSONDict] = None):
     if not TELEGRAM_BOT_TOKEN:
+        print("[telegram send skipped] TELEGRAM_BOT_TOKEN is not set on this server")
         return
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
-    except Exception:
-        pass
+        resp = httpx.post(f"{TELEGRAM_API}/sendMessage", json=payload, timeout=10)
+        if resp.status_code != 200:
+            print(f"[telegram send failed] {resp.status_code}: {resp.text}")
+    except Exception as e:
+        print(f"[telegram send error] {e}")
 
 
 def _tg_last_digits(phone: str, n: int = 9) -> str:
@@ -398,8 +405,12 @@ def _tg_handle_contact(chat_id: Any, contact: JSONDict):
         _tg_send(chat_id, "Telefon raqam noto'g'ri.")
         return
 
-    students = supabase.table("students").select("id, name, parent_number").execute().data or []
-    matched = [s for s in students if s.get("parent_number") and _tg_last_digits(s["parent_number"]) == digits]
+    students = supabase.table("students").select("id, name, phone, parent_number").execute().data or []
+    matched = [
+        s for s in students
+        if (s.get("parent_number") and _tg_last_digits(s["parent_number"]) == digits)
+        or (s.get("phone") and _tg_last_digits(s["phone"]) == digits)
+    ]
 
     if not matched:
         _tg_send(chat_id, "Bu raqam bo'yicha o'quvchi topilmadi. Administratorga murojaat qiling.")
@@ -471,6 +482,17 @@ def _tg_handle_makeup(chat_id: Any, student_ids: List[str]):
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
+    # Telegram ретраит и в итоге отключает вебхук после серии 5xx — что бы ни
+    # случилось внутри, отвечаем 200, иначе бот выглядит "мёртвым" для всех
+    # пользователей из-за одной сломанной таблицы/запроса.
+    try:
+        return await _telegram_webhook_inner(request)
+    except Exception as e:
+        print(f"[telegram webhook error] {e}")
+        return {"ok": True}
+
+
+async def _telegram_webhook_inner(request: Request):
     update = await request.json()
     message = update.get("message")
     if not message:
@@ -505,3 +527,84 @@ async def telegram_webhook(request: Request):
         _tg_send(chat_id, "Quyidagi menyudan tanlang:", MAIN_MENU_KEYBOARD)
 
     return {"ok": True}
+
+
+# =========================================================
+# Telegram Mini App — веб-интерфейс, открывающийся прямо внутри Telegram
+# (не отдельное приложение, HTML-страница на фронтенде + telegram-web-app.js).
+# Авторизация — не через email/пароль, а через initData, которую Telegram
+# подписывает сам и передаёт в открытую страницу; бэкенд проверяет подпись
+# тем же BOT_TOKEN, которым бот был создан (только у нас и у Telegram он есть).
+# =========================================================
+
+def _tg_verify_init_data(init_data: str) -> dict:
+    """Проверяет подпись initData по алгоритму Telegram. Бросает ValueError, если невалидна."""
+    if not TELEGRAM_BOT_TOKEN:
+        raise ValueError("TELEGRAM_BOT_TOKEN не задан на сервере")
+
+    pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        raise ValueError("Отсутствует hash")
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", TELEGRAM_BOT_TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        raise ValueError("Подпись initData не совпадает")
+
+    auth_date = int(pairs.get("auth_date", "0"))
+    if auth_date and (time.time() - auth_date) > 86400:
+        raise ValueError("initData устарела")
+
+    user_raw = pairs.get("user")
+    user = json.loads(user_raw) if user_raw else {}
+    return {"user": user}
+
+
+class MiniAppRequest(BaseModel):
+    initData: str
+
+
+@app.post("/telegram/miniapp/data")
+def telegram_miniapp_data(payload: MiniAppRequest):
+    try:
+        verified = _tg_verify_init_data(payload.initData)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+
+    chat_id = verified["user"].get("id")
+    if not chat_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Telegram foydalanuvchisi topilmadi")
+
+    student_ids = _tg_linked_student_ids(chat_id)
+    if not student_ids:
+        return {"linked": False, "students": []}
+
+    students = supabase.table("students").select("id, name, group_id").in_("id", student_ids).execute().data or []
+
+    result = []
+    for s in students:
+        schedule = []
+        homework = []
+        if s.get("group_id"):
+            schedule = supabase.table("schedule_entries").select("day_of_week, start_time").eq("group_id", s["group_id"]).execute().data or []
+            homework = supabase.table("homework_assignments").select("title, description, due_date") \
+                .eq("group_id", s["group_id"]).order("due_date", desc=True).limit(10).execute().data or []
+
+        coverage = supabase.table("student_coverage_view").select("covered").eq("student_id", s["id"]).limit(1).execute().data
+        covered = coverage[0]["covered"] if coverage else None
+
+        makeup = supabase.table("makeup_lessons").select("*").eq("student_id", s["id"]).in_("status", ["owed", "scheduled"]).execute().data or []
+
+        result.append({
+            "id": s["id"],
+            "name": s["name"],
+            "schedule": schedule,
+            "homework": homework,
+            "covered": covered,
+            "makeup": makeup,
+        })
+
+    return {"linked": True, "students": result}
