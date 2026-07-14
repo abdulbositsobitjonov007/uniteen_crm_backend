@@ -9,6 +9,8 @@ import time
 import hmac
 import hashlib
 import json
+import uuid
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 import httpx
 from dotenv import load_dotenv
@@ -38,9 +40,10 @@ app.add_middleware(
 ALLOWED_CREATOR_ROLES = {"boss", "manager", "academic_director", "head_teacher"}
 
 
-def get_caller_profile(authorization: str | None) -> dict:
-    """Проверяет JWT из заголовка Authorization и возвращает profile вызывающего.
-    Бросает HTTPException(401/403), если токен отсутствует/невалиден или роль не разрешена."""
+def get_caller_user(authorization: str | None):
+    """Проверяет, что JWT в заголовке Authorization принадлежит настоящей
+    Supabase-сессии. Не проверяет роль — просто "это авторизованный сотрудник
+    CRM, а не случайный запрос из интернета"."""
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Отсутствует токен авторизации")
 
@@ -53,6 +56,14 @@ def get_caller_profile(authorization: str | None) -> dict:
 
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Недействительный токен авторизации")
+
+    return user
+
+
+def get_caller_profile(authorization: str | None) -> dict:
+    """Проверяет JWT из заголовка Authorization и возвращает profile вызывающего.
+    Бросает HTTPException(401/403), если токен отсутствует/невалиден или роль не разрешена."""
+    user = get_caller_user(authorization)
 
     profile = supabase.table("profiles").select("role, assigned_subject_id").eq("id", user.id).single().execute()
     caller_profile = profile.data or {}
@@ -143,6 +154,12 @@ def create_employee(employee: EmployeeCreate, authorization: str | None = Header
 # протестирован против настоящего мерчант-аккаунта Payme.
 # =========================================================
 PAYME_KEY = os.getenv("PAYME_KEY") or ""
+# Не секрет — тот же ID уже зашит в публичный фронтенд-бандл (VITE_PAYME_MERCHANT_ID).
+PAYME_MERCHANT_ID = os.getenv("PAYME_MERCHANT_ID") or "69afcf3bdf9eb25a97935f8e"
+
+
+def _payme_checkout_url() -> str:
+    return f"https://payme.uz/fallback/merchant/?id={PAYME_MERCHANT_ID}"
 
 
 def _payme_error(request_id, code: int, message_ru: str):
@@ -449,16 +466,64 @@ def _tg_handle_homework(chat_id, student_ids: List[str]):
     _tg_send(chat_id, "\n".join(lines) if lines else "Vazifalar topilmadi")
 
 
+def _current_period() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
+def _fmt_money(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ") + " so'm"
+
+
+def _student_balance(student_id: str) -> dict:
+    """Реальный баланс за текущий месяц: сколько выставлено, сколько уже
+    оплачено (через payment_allocations) и сколько осталось долга. Если
+    месяц покрыт активным пакетом (student_packages) — счёт не нужен."""
+    period = _current_period()
+
+    package_rows = supabase.table("student_packages").select("id") \
+        .eq("student_id", student_id).lte("start_period", period).gte("end_period", period).limit(1).execute().data
+    covered_by_package = bool(package_rows)
+
+    invoice_rows = supabase.table("invoices").select("id, amount, status") \
+        .eq("student_id", student_id).eq("period", period).limit(1).execute().data
+    invoice = invoice_rows[0] if invoice_rows else None
+
+    if not invoice:
+        return {"period": period, "total": None, "paid": 0.0, "owed": 0.0, "covered_by_package": covered_by_package, "invoice_id": None}
+
+    alloc_rows = supabase.table("payment_allocations").select("amount").eq("invoice_id", invoice["id"]).execute().data or []
+    paid = sum(float(a["amount"]) for a in alloc_rows)
+    total = float(invoice["amount"])
+    owed = max(0.0, total - paid)
+    return {"period": period, "total": total, "paid": paid, "owed": owed, "covered_by_package": covered_by_package, "invoice_id": invoice["id"]}
+
+
 def _tg_handle_balance(chat_id, student_ids: List[str]):
     lines = []
+    any_owed = False
     for sid in student_ids:
         student = supabase.table("students").select("name").eq("id", sid).limit(1).execute().data
         student_name = student[0]["name"] if student else "?"
-        coverage = supabase.table("student_coverage_view").select("covered").eq("student_id", sid).limit(1).execute().data
-        covered = coverage[0]["covered"] if coverage else None
-        status_text = "✅ To'langan" if covered else ("⚠️ Qarzdorlik bor" if covered is False else "Ma'lumot yo'q")
-        lines.append(f"<b>{student_name}</b>: {status_text}")
-    _tg_send(chat_id, "\n".join(lines) if lines else "Ma'lumot topilmadi")
+        bal = _student_balance(sid)
+
+        if bal["covered_by_package"]:
+            lines.append(f"<b>{student_name}</b>: ✅ Paket orqali to'langan")
+        elif bal["total"] is None:
+            lines.append(f"<b>{student_name}</b>: Bu oy uchun hisob-faktura hali chiqarilmagan")
+        elif bal["owed"] <= 0:
+            lines.append(f"<b>{student_name}</b>: ✅ To'langan ({_fmt_money(bal['paid'])})")
+        else:
+            any_owed = True
+            lines.append(
+                f"<b>{student_name}</b>: ⚠️ To'langan {_fmt_money(bal['paid'])} / Jami {_fmt_money(bal['total'])}\n"
+                f"   Qarz: <b>{_fmt_money(bal['owed'])}</b>"
+            )
+
+    reply_markup = None
+    if any_owed:
+        reply_markup = {"inline_keyboard": [[{"text": "💳 To'lash (Payme)", "url": _payme_checkout_url()}]]}
+
+    _tg_send(chat_id, "\n".join(lines) if lines else "Ma'lumot topilmadi", reply_markup)
 
 
 def _tg_handle_makeup(chat_id, student_ids: List[str]):
@@ -473,6 +538,59 @@ def _tg_handle_makeup(chat_id, student_ids: List[str]):
         else:
             lines.append(f"📌 {r['original_date']} → {r.get('makeup_date') or '-'} sanasiga o'tkazildi")
     _tg_send(chat_id, "\n".join(lines))
+
+
+def _tg_download_and_store_photo(file_id: str, student_id: str) -> Optional[str]:
+    """Скачивает файл у Telegram и кладёт в приватный Storage bucket
+    payment-screenshots. Возвращает storage_path или None при ошибке."""
+    try:
+        info = httpx.get(f"{TELEGRAM_API}/getFile", params={"file_id": file_id}, timeout=15).json()
+        file_path = (info.get("result") or {}).get("file_path")
+        if not file_path:
+            print(f"[payment screenshot] getFile vernul bo'sh natija: {info}")
+            return None
+
+        file_bytes = httpx.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}", timeout=25).content
+        ext = file_path.rsplit(".", 1)[-1] if "." in file_path else "jpg"
+        storage_path = f"{student_id}/{uuid.uuid4()}.{ext}"
+
+        supabase.storage.from_("payment-screenshots").upload(
+            storage_path, file_bytes, {"content-type": "image/jpeg"}
+        )
+        return storage_path
+    except Exception as e:
+        print(f"[payment screenshot upload error] {e}")
+        return None
+
+
+def _tg_handle_photo(chat_id, student_ids: List[str], photo: List[dict], caption: Optional[str]):
+    if not student_ids:
+        return
+    # Telegram присылает один и тот же снимок в нескольких разрешениях —
+    # берём самое крупное для лучшего качества при просмотре в CRM.
+    largest = max(photo, key=lambda p: p.get("file_size") or p.get("width") or 0)
+    file_id = largest["file_id"]
+
+    # К какому именно ученику относится чек — неясно, если к одному чату
+    # привязано несколько детей; прикрепляем ко всем, бухгалтер разберётся
+    # при подтверждении, кому именно засчитать оплату.
+    saved_any = False
+    for sid in student_ids:
+        storage_path = _tg_download_and_store_photo(file_id, sid)
+        supabase.table("payment_screenshots").insert({
+            "student_id": sid,
+            "chat_id": chat_id,
+            "telegram_file_id": file_id,
+            "storage_path": storage_path,
+            "caption": caption,
+            "status": "pending",
+        }).execute()
+        saved_any = saved_any or bool(storage_path)
+
+    if saved_any:
+        _tg_send(chat_id, "To'lov cheki qabul qilindi ✅ Administratsiya tekshiradi va tasdiqlaydi.")
+    else:
+        _tg_send(chat_id, "Chekni saqlab bo'lmadi, birozdan so'ng qayta urinib ko'ring yoki administratorga murojaat qiling.")
 
 
 @app.post("/telegram/webhook")
@@ -496,6 +614,7 @@ async def _telegram_webhook_inner(request: Request):
     chat_id = message["chat"]["id"]
     text = (message.get("text") or "").strip()
     contact = message.get("contact")
+    photo = message.get("photo")
 
     if text == "/start":
         _tg_handle_start(chat_id)
@@ -508,6 +627,10 @@ async def _telegram_webhook_inner(request: Request):
     student_ids = _tg_linked_student_ids(chat_id)
     if not student_ids:
         _tg_send(chat_id, "Avval ro'yxatdan o'ting: /start buyrug'ini yuboring.")
+        return {"ok": True}
+
+    if photo:
+        _tg_handle_photo(chat_id, student_ids, photo, message.get("caption"))
         return {"ok": True}
 
     if text in ("📅 Jadval", "/schedule"):
@@ -592,6 +715,7 @@ def telegram_miniapp_data(payload: MiniAppRequest):
         covered = coverage[0]["covered"] if coverage else None
 
         makeup = supabase.table("makeup_lessons").select("*").eq("student_id", s["id"]).in_("status", ["owed", "scheduled"]).execute().data or []
+        balance = _student_balance(s["id"])
 
         result.append({
             "id": s["id"],
@@ -600,6 +724,47 @@ def telegram_miniapp_data(payload: MiniAppRequest):
             "homework": homework,
             "covered": covered,
             "makeup": makeup,
+            "balance": balance,
         })
 
-    return {"linked": True, "students": result}
+    return {"linked": True, "students": result, "paymeUrl": _payme_checkout_url()}
+
+
+# =========================================================
+# Уведомления родителям/студентам из CRM (оплата принята, отметки,
+# напоминания и т.п.) — sendTelegramNotification() на фронтенде раньше
+# просто писала строку в telegram_notifications, которую никто не читал.
+# Теперь фронтенд зовёт этот эндпоинт напрямую, и бот шлёт сообщение сразу.
+# =========================================================
+class NotifyRequest(BaseModel):
+    student_id: Optional[str] = None
+    phone: Optional[str] = None
+    message: str
+
+
+@app.post("/telegram/notify")
+def telegram_notify(payload: NotifyRequest, authorization: str | None = Header(default=None)):
+    get_caller_user(authorization)  # любой авторизованный сотрудник CRM, без ограничения по роли
+
+    chat_ids: set = set()
+    if payload.student_id:
+        rows = supabase.table("telegram_links").select("chat_id").eq("student_id", payload.student_id).execute().data or []
+        chat_ids.update(r["chat_id"] for r in rows)
+
+    if not chat_ids and payload.phone:
+        digits = _tg_last_digits(payload.phone)
+        if digits:
+            students = supabase.table("students").select("id, phone, parent_number").execute().data or []
+            matched_ids = [
+                s["id"] for s in students
+                if (s.get("parent_number") and _tg_last_digits(s["parent_number"]) == digits)
+                or (s.get("phone") and _tg_last_digits(s["phone"]) == digits)
+            ]
+            if matched_ids:
+                rows = supabase.table("telegram_links").select("chat_id").in_("student_id", matched_ids).execute().data or []
+                chat_ids.update(r["chat_id"] for r in rows)
+
+    for cid in chat_ids:
+        _tg_send(cid, payload.message)
+
+    return {"sent": len(chat_ids)}
