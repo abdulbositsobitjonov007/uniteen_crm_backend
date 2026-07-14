@@ -400,8 +400,12 @@ def _tg_handle_contact(chat_id, contact: dict):
         _tg_send(chat_id, "Telefon raqam noto'g'ri.")
         return
 
-    students = supabase.table("students").select("id, name, parent_number").execute().data or []
-    matched = [s for s in students if s.get("parent_number") and _tg_last_digits(s["parent_number"]) == digits]
+    students = supabase.table("students").select("id, name, phone, parent_number").execute().data or []
+    matched = [
+        s for s in students
+        if (s.get("parent_number") and _tg_last_digits(s["parent_number"]) == digits)
+        or (s.get("phone") and _tg_last_digits(s["phone"]) == digits)
+    ]
 
     if not matched:
         _tg_send(chat_id, "Bu raqam bo'yicha o'quvchi topilmadi. Administratorga murojaat qiling.")
