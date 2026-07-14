@@ -482,30 +482,47 @@ def _fmt_money(value: float) -> str:
     return f"{value:,.0f}".replace(",", " ") + " so'm"
 
 
+def _billing_due_day() -> int:
+    rows = supabase.table("billing_settings").select("due_day").eq("id", 1).limit(1).execute().data
+    return (rows[0].get("due_day") if rows else None) or 5
+
+
 def _student_balance(student_id: str) -> dict:
     """Реальный баланс за текущий месяц: сколько выставлено, сколько уже
     оплачено (через payment_allocations), сколько осталось долга и есть ли
     переплата. Если месяц покрыт активным пакетом (student_packages) —
-    счёт не нужен."""
+    счёт не нужен. Если счёт ЕЩЁ не сформирован бухгалтерией (нет строки в
+    invoices) — не молчим, а показываем ожидаемую сумму (tuition_amount
+    студента) и дату, до которой обычно нужно оплатить (billing_settings)."""
     period = _current_period()
 
     package_rows = supabase.table("student_packages").select("id") \
         .eq("student_id", student_id).lte("start_period", period).gte("end_period", period).limit(1).execute().data
     covered_by_package = bool(package_rows)
 
-    invoice_rows = supabase.table("invoices").select("id, amount, status") \
+    invoice_rows = supabase.table("invoices").select("id, amount, status, due_date") \
         .eq("student_id", student_id).eq("period", period).limit(1).execute().data
     invoice = invoice_rows[0] if invoice_rows else None
 
     if not invoice:
-        return {"period": period, "total": None, "paid": 0.0, "owed": 0.0, "credit": 0.0, "covered_by_package": covered_by_package, "invoice_id": None}
+        student_rows = supabase.table("students").select("tuition_amount").eq("id", student_id).limit(1).execute().data
+        tuition = (student_rows[0].get("tuition_amount") if student_rows else None) or None
+        due_date = f"{period}-{_billing_due_day():02d}"
+        return {
+            "period": period, "invoice_issued": False, "total": float(tuition) if tuition else None,
+            "paid": 0.0, "owed": 0.0, "credit": 0.0, "covered_by_package": covered_by_package,
+            "invoice_id": None, "due_date": due_date,
+        }
 
     alloc_rows = supabase.table("payment_allocations").select("amount").eq("invoice_id", invoice["id"]).execute().data or []
     paid = sum(float(a["amount"]) for a in alloc_rows)
     total = float(invoice["amount"])
     owed = max(0.0, total - paid)
     credit = max(0.0, paid - total)
-    return {"period": period, "total": total, "paid": paid, "owed": owed, "credit": credit, "covered_by_package": covered_by_package, "invoice_id": invoice["id"]}
+    return {
+        "period": period, "invoice_issued": True, "total": total, "paid": paid, "owed": owed, "credit": credit,
+        "covered_by_package": covered_by_package, "invoice_id": invoice["id"], "due_date": invoice.get("due_date"),
+    }
 
 
 def _student_subject(student_id: str) -> Optional[str]:
@@ -517,11 +534,49 @@ def _student_subject(student_id: str) -> Optional[str]:
     return group_rows[0].get("subject") if group_rows else None
 
 
-def _recent_absences(student_id: str, days: int = 30) -> List[dict]:
-    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    return supabase.table("attendance").select("date, notes") \
-        .eq("student_id", student_id).eq("status", "absent") \
-        .gte("date", since).order("date", desc=True).execute().data or []
+WEEKDAY_PY_INDEX = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _month_bounds():
+    today = datetime.now(timezone.utc).date()
+    start = today.replace(day=1)
+    next_month = start.replace(day=28) + timedelta(days=4)
+    end = next_month - timedelta(days=next_month.day)
+    return start, end
+
+
+def _monthly_attendance_stats(student_id: str) -> dict:
+    """Сколько уроков в этом месяце должно пройти по расписанию группы
+    (за весь месяц), сколько студент реально посетил, и конкретные даты
+    пропусков — родителю понятнее "5 dan 8 tasiga keldi", чем просто
+    список дат."""
+    start, end = _month_bounds()
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    student_rows = supabase.table("students").select("group_id").eq("id", student_id).limit(1).execute().data
+    group_id = student_rows[0].get("group_id") if student_rows else None
+
+    expected = 0
+    if group_id:
+        entries = supabase.table("schedule_entries").select("day_of_week").eq("group_id", group_id).execute().data or []
+        weekdays = {WEEKDAY_PY_INDEX[e["day_of_week"]] for e in entries if e.get("day_of_week") in WEEKDAY_PY_INDEX}
+        if weekdays:
+            d = start
+            while d <= end:
+                if d.weekday() in weekdays:
+                    expected += 1
+                d += timedelta(days=1)
+
+    attendance_rows = supabase.table("attendance").select("date, status, notes") \
+        .eq("student_id", student_id).gte("date", start_str).lte("date", end_str).execute().data or []
+    attended = sum(1 for a in attendance_rows if a["status"] == "present")
+    absences = [a for a in attendance_rows if a["status"] == "absent"]
+
+    return {"expected": expected, "attended": attended, "absences": absences}
 
 
 def _tg_handle_balance(chat_id, student_ids: List[str]):
@@ -537,24 +592,25 @@ def _tg_handle_balance(chat_id, student_ids: List[str]):
         title = f"<b>{student_name}</b>" + (f" ({subject})" if subject else "")
 
         bal = _student_balance(sid)
+        due_line = f"\n📆 To'lov sanasi: {bal['due_date']}" if bal.get("due_date") else ""
         if bal["covered_by_package"]:
             money_line = "✅ Paket orqali to'langan"
-        elif bal["total"] is None:
-            money_line = "Bu oy uchun hisob-faktura hali chiqarilmagan"
+        elif not bal["invoice_issued"]:
+            estimate = f" (taxminan {_fmt_money(bal['total'])})" if bal["total"] else ""
+            money_line = f"Bu oy uchun hisob-faktura hali chiqarilmagan{estimate}{due_line}"
         elif bal["owed"] > 0:
-            money_line = f"⚠️ To'langan {_fmt_money(bal['paid'])} / Jami {_fmt_money(bal['total'])}\nQarz: <b>{_fmt_money(bal['owed'])}</b>"
+            money_line = f"⚠️ To'langan {_fmt_money(bal['paid'])} / Jami {_fmt_money(bal['total'])}\nQarz: <b>{_fmt_money(bal['owed'])}</b>{due_line}"
             pay_buttons.append({"text": f"💳 {student_name} uchun to'lash", "url": _payme_checkout_url(bal["invoice_id"], bal["owed"])})
         elif bal["credit"] > 0:
             money_line = f"✅ To'langan, ortiqcha: <b>{_fmt_money(bal['credit'])}</b>"
         else:
             money_line = f"✅ To'langan ({_fmt_money(bal['paid'])})"
 
-        absences = _recent_absences(sid, 30)
-        if absences:
-            dates = ", ".join(a["date"] for a in absences[:10])
-            attendance_line = f"📅 Oxirgi 30 kunda {len(absences)} marta qoldirgan: {dates}"
-        else:
-            attendance_line = "📅 Oxirgi 30 kunda darsni qoldirmagan ✅"
+        stats = _monthly_attendance_stats(sid)
+        attendance_line = f"📊 Bu oy: {stats['attended']}/{stats['expected']} darsga keldi"
+        if stats["absences"]:
+            dates = ", ".join(a["date"] for a in stats["absences"][:10])
+            attendance_line += f"\n📅 Qoldirgan kunlar: {dates}"
 
         lines.append(f"{title}\n{money_line}\n{attendance_line}")
 
@@ -760,7 +816,7 @@ def telegram_miniapp_data(payload: MiniAppRequest):
         balance = _student_balance(s["id"])
         balance["pay_url"] = _payme_checkout_url(balance["invoice_id"], balance["owed"]) if balance["owed"] > 0 else None
 
-        absences = _recent_absences(s["id"], 30)
+        attendance_stats = _monthly_attendance_stats(s["id"])
 
         result.append({
             "id": s["id"],
@@ -771,7 +827,7 @@ def telegram_miniapp_data(payload: MiniAppRequest):
             "covered": covered,
             "makeup": makeup,
             "balance": balance,
-            "absences": absences,
+            "attendance": attendance_stats,
         })
 
     return {"linked": True, "students": result, "subjectCount": len(result)}
