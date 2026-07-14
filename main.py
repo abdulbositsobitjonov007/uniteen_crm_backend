@@ -10,7 +10,7 @@ import hmac
 import hashlib
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import parse_qsl
 import httpx
 from dotenv import load_dotenv
@@ -158,8 +158,16 @@ PAYME_KEY = os.getenv("PAYME_KEY") or ""
 PAYME_MERCHANT_ID = os.getenv("PAYME_MERCHANT_ID") or "69afcf3bdf9eb25a97935f8e"
 
 
-def _payme_checkout_url() -> str:
-    return f"https://payme.uz/fallback/merchant/?id={PAYME_MERCHANT_ID}"
+def _payme_checkout_url(invoice_id: Optional[str] = None, amount_uzs: Optional[float] = None) -> str:
+    """Настоящая ссылка на оплату конкретного счёта. Без invoice_id/суммы
+    (или пока нет открытого долга) отдаём fallback-адрес — он не открывает
+    форму оплаты, только показывает общую страницу Payme по кассе."""
+    if not invoice_id or not amount_uzs:
+        return f"https://payme.uz/fallback/merchant/?id={PAYME_MERCHANT_ID}"
+    amount_tiyin = int(round(amount_uzs * 100))
+    raw = f"m={PAYME_MERCHANT_ID};ac.invoice_id={invoice_id};a={amount_tiyin}"
+    encoded = base64.b64encode(raw.encode()).decode()
+    return f"https://checkout.paycom.uz/{encoded}"
 
 
 def _payme_error(request_id, code: int, message_ru: str):
@@ -476,8 +484,9 @@ def _fmt_money(value: float) -> str:
 
 def _student_balance(student_id: str) -> dict:
     """Реальный баланс за текущий месяц: сколько выставлено, сколько уже
-    оплачено (через payment_allocations) и сколько осталось долга. Если
-    месяц покрыт активным пакетом (student_packages) — счёт не нужен."""
+    оплачено (через payment_allocations), сколько осталось долга и есть ли
+    переплата. Если месяц покрыт активным пакетом (student_packages) —
+    счёт не нужен."""
     period = _current_period()
 
     package_rows = supabase.table("student_packages").select("id") \
@@ -489,41 +498,68 @@ def _student_balance(student_id: str) -> dict:
     invoice = invoice_rows[0] if invoice_rows else None
 
     if not invoice:
-        return {"period": period, "total": None, "paid": 0.0, "owed": 0.0, "covered_by_package": covered_by_package, "invoice_id": None}
+        return {"period": period, "total": None, "paid": 0.0, "owed": 0.0, "credit": 0.0, "covered_by_package": covered_by_package, "invoice_id": None}
 
     alloc_rows = supabase.table("payment_allocations").select("amount").eq("invoice_id", invoice["id"]).execute().data or []
     paid = sum(float(a["amount"]) for a in alloc_rows)
     total = float(invoice["amount"])
     owed = max(0.0, total - paid)
-    return {"period": period, "total": total, "paid": paid, "owed": owed, "covered_by_package": covered_by_package, "invoice_id": invoice["id"]}
+    credit = max(0.0, paid - total)
+    return {"period": period, "total": total, "paid": paid, "owed": owed, "credit": credit, "covered_by_package": covered_by_package, "invoice_id": invoice["id"]}
+
+
+def _student_subject(student_id: str) -> Optional[str]:
+    student_rows = supabase.table("students").select("group_id").eq("id", student_id).limit(1).execute().data
+    group_id = student_rows[0].get("group_id") if student_rows else None
+    if not group_id:
+        return None
+    group_rows = supabase.table("groups").select("subject").eq("id", group_id).limit(1).execute().data
+    return group_rows[0].get("subject") if group_rows else None
+
+
+def _recent_absences(student_id: str, days: int = 30) -> List[dict]:
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    return supabase.table("attendance").select("date, notes") \
+        .eq("student_id", student_id).eq("status", "absent") \
+        .gte("date", since).order("date", desc=True).execute().data or []
 
 
 def _tg_handle_balance(chat_id, student_ids: List[str]):
     lines = []
-    any_owed = False
+    if len(student_ids) > 1:
+        lines.append(f"📚 Siz {len(student_ids)} ta fan bo'yicha o'qiyapsiz:")
+
+    pay_buttons = []
     for sid in student_ids:
-        student = supabase.table("students").select("name").eq("id", sid).limit(1).execute().data
-        student_name = student[0]["name"] if student else "?"
+        student_rows = supabase.table("students").select("name").eq("id", sid).limit(1).execute().data
+        student_name = student_rows[0]["name"] if student_rows else "?"
+        subject = _student_subject(sid)
+        title = f"<b>{student_name}</b>" + (f" ({subject})" if subject else "")
+
         bal = _student_balance(sid)
-
         if bal["covered_by_package"]:
-            lines.append(f"<b>{student_name}</b>: ✅ Paket orqali to'langan")
+            money_line = "✅ Paket orqali to'langan"
         elif bal["total"] is None:
-            lines.append(f"<b>{student_name}</b>: Bu oy uchun hisob-faktura hali chiqarilmagan")
-        elif bal["owed"] <= 0:
-            lines.append(f"<b>{student_name}</b>: ✅ To'langan ({_fmt_money(bal['paid'])})")
+            money_line = "Bu oy uchun hisob-faktura hali chiqarilmagan"
+        elif bal["owed"] > 0:
+            money_line = f"⚠️ To'langan {_fmt_money(bal['paid'])} / Jami {_fmt_money(bal['total'])}\nQarz: <b>{_fmt_money(bal['owed'])}</b>"
+            pay_buttons.append({"text": f"💳 {student_name} uchun to'lash", "url": _payme_checkout_url(bal["invoice_id"], bal["owed"])})
+        elif bal["credit"] > 0:
+            money_line = f"✅ To'langan, ortiqcha: <b>{_fmt_money(bal['credit'])}</b>"
         else:
-            any_owed = True
-            lines.append(
-                f"<b>{student_name}</b>: ⚠️ To'langan {_fmt_money(bal['paid'])} / Jami {_fmt_money(bal['total'])}\n"
-                f"   Qarz: <b>{_fmt_money(bal['owed'])}</b>"
-            )
+            money_line = f"✅ To'langan ({_fmt_money(bal['paid'])})"
 
-    reply_markup = None
-    if any_owed:
-        reply_markup = {"inline_keyboard": [[{"text": "💳 To'lash (Payme)", "url": _payme_checkout_url()}]]}
+        absences = _recent_absences(sid, 30)
+        if absences:
+            dates = ", ".join(a["date"] for a in absences[:10])
+            attendance_line = f"📅 Oxirgi 30 kunda {len(absences)} marta qoldirgan: {dates}"
+        else:
+            attendance_line = "📅 Oxirgi 30 kunda darsni qoldirmagan ✅"
 
-    _tg_send(chat_id, "\n".join(lines) if lines else "Ma'lumot topilmadi", reply_markup)
+        lines.append(f"{title}\n{money_line}\n{attendance_line}")
+
+    reply_markup = {"inline_keyboard": [[b] for b in pay_buttons]} if pay_buttons else None
+    _tg_send(chat_id, "\n\n".join(lines) if lines else "Ma'lumot topilmadi", reply_markup)
 
 
 def _tg_handle_makeup(chat_id, student_ids: List[str]):
@@ -702,6 +738,12 @@ def telegram_miniapp_data(payload: MiniAppRequest):
 
     students = supabase.table("students").select("id, name, group_id").in_("id", student_ids).execute().data or []
 
+    group_ids = [s["group_id"] for s in students if s.get("group_id")]
+    groups_by_id = {}
+    if group_ids:
+        group_rows = supabase.table("groups").select("id, subject").in_("id", group_ids).execute().data or []
+        groups_by_id = {g["id"]: g.get("subject") for g in group_rows}
+
     result = []
     for s in students:
         schedule = []
@@ -716,18 +758,23 @@ def telegram_miniapp_data(payload: MiniAppRequest):
 
         makeup = supabase.table("makeup_lessons").select("*").eq("student_id", s["id"]).in_("status", ["owed", "scheduled"]).execute().data or []
         balance = _student_balance(s["id"])
+        balance["pay_url"] = _payme_checkout_url(balance["invoice_id"], balance["owed"]) if balance["owed"] > 0 else None
+
+        absences = _recent_absences(s["id"], 30)
 
         result.append({
             "id": s["id"],
             "name": s["name"],
+            "subject": groups_by_id.get(s.get("group_id")),
             "schedule": schedule,
             "homework": homework,
             "covered": covered,
             "makeup": makeup,
             "balance": balance,
+            "absences": absences,
         })
 
-    return {"linked": True, "students": result, "paymeUrl": _payme_checkout_url()}
+    return {"linked": True, "students": result, "subjectCount": len(result)}
 
 
 # =========================================================
