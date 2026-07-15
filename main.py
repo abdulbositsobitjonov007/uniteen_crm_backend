@@ -540,6 +540,45 @@ def _student_balance(student_id: str) -> dict:
     }
 
 
+def _lesson_history(student_id: str) -> List[dict]:
+    """Последние уроки ученика — то же, что учитель видит в клетках
+    GroupAttendancePanel (дата/статус/оценка/комментарий), только на
+    просмотр. score хранится 0-100 всегда; grading_scale учителя,
+    который вёл конкретный урок, отдаём рядом — форматирует фронтенд
+    (formatScore), чтобы не дублировать шкалу на бэкенде."""
+    rows = supabase.table("attendance").select("date, status, score, notes, teacher_id") \
+        .eq("student_id", student_id).order("date", desc=True).limit(10).execute().data or []
+    teacher_ids = list({r["teacher_id"] for r in rows if r.get("teacher_id")})
+    scales: dict = {}
+    if teacher_ids:
+        profs = supabase.table("profiles").select("id, grading_scale").in_("id", teacher_ids).execute().data or []
+        scales = {p["id"]: p.get("grading_scale") or "percentage" for p in profs}
+    return [
+        {
+            "date": r["date"],
+            "status": r["status"],
+            "score": r.get("score"),
+            "notes": r.get("notes"),
+            "grading_scale": scales.get(r.get("teacher_id"), "percentage"),
+        }
+        for r in rows
+    ]
+
+
+def _support_info(student_id: str) -> Optional[dict]:
+    """Если у ученика есть активный support-case (24/52_support_cases.sql) —
+    отдаём историю сессий (дата/тема/результат) родителю. Внутренние note и
+    tags (для эскалации между учителями) сюда не идут — только то, что
+    показано в OUTCOME_META на фронтенде."""
+    assignment_rows = supabase.table("support_assignments").select("id") \
+        .eq("student_id", student_id).eq("active", True).limit(1).execute().data
+    if not assignment_rows:
+        return None
+    sessions = supabase.table("support_interventions").select("session_date, topic, outcome") \
+        .eq("assignment_id", assignment_rows[0]["id"]).order("session_date", desc=True).limit(10).execute().data or []
+    return {"sessions": sessions}
+
+
 def _student_subject(student_id: str) -> Optional[str]:
     student_rows = supabase.table("students").select("group_id").eq("id", student_id).limit(1).execute().data
     group_id = student_rows[0].get("group_id") if student_rows else None
@@ -835,6 +874,8 @@ def telegram_miniapp_data(payload: MiniAppRequest):
         balance["pay_url"] = _payme_checkout_url(balance["invoice_id"], balance["owed"]) if balance["owed"] > 0 else None
 
         attendance_stats = _monthly_attendance_stats(s["id"])
+        lessons = _lesson_history(s["id"])
+        support = _support_info(s["id"])
 
         result.append({
             "id": s["id"],
@@ -846,6 +887,8 @@ def telegram_miniapp_data(payload: MiniAppRequest):
             "makeup": makeup,
             "balance": balance,
             "attendance": attendance_stats,
+            "lessons": lessons,
+            "support": support,
         })
 
     return {"linked": True, "students": result, "subjectCount": len(result)}
