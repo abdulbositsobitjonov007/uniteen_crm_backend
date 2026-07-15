@@ -504,9 +504,24 @@ def _student_balance(student_id: str) -> dict:
         .eq("student_id", student_id).eq("period", period).limit(1).execute().data
     invoice = invoice_rows[0] if invoice_rows else None
 
+    student_rows = supabase.table("students").select("tuition_amount").eq("id", student_id).limit(1).execute().data
+    tuition = (student_rows[0].get("tuition_amount") if student_rows else None) or None
+
+    if not invoice and not covered_by_package and tuition:
+        # Бухгалтерия ещё не нажала "Yaratish" в Finance и cron ещё не сработал —
+        # без строки в invoices нет invoice_id, а без него оплата через бота
+        # невозможна (Payme-ссылке нужен конкретный счёт). Формируем счёт сразу
+        # тем же идемпотентным RPC, что и кнопка/cron — так "To'lash" в боте
+        # появляется сама, а не только после ручного действия в Finance.
+        try:
+            supabase.rpc("generate_monthly_invoices", {"p_period": period}).execute()
+        except Exception:
+            pass
+        invoice_rows = supabase.table("invoices").select("id, amount, status, due_date") \
+            .eq("student_id", student_id).eq("period", period).limit(1).execute().data
+        invoice = invoice_rows[0] if invoice_rows else None
+
     if not invoice:
-        student_rows = supabase.table("students").select("tuition_amount").eq("id", student_id).limit(1).execute().data
-        tuition = (student_rows[0].get("tuition_amount") if student_rows else None) or None
         due_date = f"{period}-{_billing_due_day():02d}"
         return {
             "period": period, "invoice_issued": False, "total": float(tuition) if tuition else None,
@@ -613,6 +628,9 @@ def _tg_handle_balance(chat_id, student_ids: List[str]):
             attendance_line += f"\n📅 Qoldirgan kunlar: {dates}"
 
         lines.append(f"{title}\n{money_line}\n{attendance_line}")
+
+    if pay_buttons:
+        lines.append("💡 Havola orqali to'lang, so'ng to'lov chekining skrinshotini shu botga yuboring — administratsiya tekshirib tasdiqlaydi.")
 
     reply_markup = {"inline_keyboard": [[b] for b in pay_buttons]} if pay_buttons else None
     _tg_send(chat_id, "\n\n".join(lines) if lines else "Ma'lumot topilmadi", reply_markup)
